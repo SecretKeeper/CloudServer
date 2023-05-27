@@ -25,8 +25,20 @@ fi
 
 # Create a Kubernetes cluster if not already created
 if ! [ -x "$(command -v kubectl)" ] || ! kubectl get nodes &>/dev/null; then
-  kubectl create cluster
+  # Install kubeadm, kubelet, and kubectl
+  sudo apt update
+  sudo apt install -y docker.io
+  sudo apt install -y kubeadm kubelet kubectl
+
+  # Initialize the cluster
+  sudo kubeadm init
+
+  # Set up kubectl configuration for the current user
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
 fi
+
 
 # Install Istio on the Kubernetes cluster if not already installed
 if ! kubectl get namespaces istio-system &>/dev/null; then
