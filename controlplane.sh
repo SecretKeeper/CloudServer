@@ -1,144 +1,138 @@
 #!/bin/bash
 
-# Check if curl is installed
-if ! command -v curl &> /dev/null; then
-    echo "Installing curl..."
-    sudo apt-get update
-    sudo apt-get install -y curl
-    echo "curl installed successfully."
-else
-    echo "curl is already installed. Skipping installation."
+# Get current VM IP address
+IP_ADDRESS=95.215.173.110
+
+# Install Docker if not already installed
+if ! [ -x "$(command -v docker)" ]; then
+  curl -fsSL https://get.docker.com -o get-docker.sh
+  sudo sh get-docker.sh
 fi
 
-# Check if Docker is already installed
-if ! command -v docker &> /dev/null; then
-    echo "Installing Docker..."
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    sudo usermod -aG docker $USER
-    echo "Docker installed successfully."
-else
-    echo "Docker is already installed. Skipping installation."
+# Install Kubernetes if not already installed
+if ! [ -x "$(command -v kubectl)" ]; then
+  curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+  chmod +x kubectl
+  sudo mv kubectl /usr/local/bin/
 fi
 
-# Check if kubectl is installed
-if ! command -v kubectl &> /dev/null; then
-    # Install kubeadm, kubelet, and kubectl
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-    chmod +x kubectl
-    sudo mv kubectl /usr/local/bin/
-
-    curl -sSL -o /usr/local/bin/kubeadm https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubeadm
-    chmod +x /usr/local/bin/kubeadm
-
-    curl -sSL -o /usr/local/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubelet
-    chmod +x /usr/local/bin/kubelet
-
-    echo "Kubernetes components (kubectl, kubeadm, kubelet) installed successfully."
-else
-    echo "kubectl is already installed. Skipping installation."
+# Install Istio if not already installed
+if ! [ -x "$(command -v istioctl)" ]; then
+  curl -L https://istio.io/downloadIstio | sh -
+  cd istio-*/ && export PATH=$PWD/bin:$PATH
+  cd ..
 fi
 
-echo "Installation and container setup complete"
+# Create a Kubernetes cluster if not already created
+if ! [ -x "$(command -v kubectl)" ] || ! kubectl get nodes &>/dev/null; then
+  kubectl create cluster
+fi
 
+# Install Istio on the Kubernetes cluster if not already installed
+if ! kubectl get namespaces istio-system &>/dev/null; then
+  istioctl install
+fi
 
-# Initialize Kubernetes cluster with kubeadm
-echo "Initializing Kubernetes cluster with kubeadm..."
-sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+# Verify Istio installation
+kubectl get svc -n istio-system
 
-# Set up kubeconfig for the current user
-mkdir -p $HOME/.kube
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-
-# Install a network plugin (Calico)
-echo "Installing network plugin (Calico)..."
-kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
-
-echo "Kubernetes cluster initialized successfully"
-
-
-# Install ArgoCD CLI
-curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-chmod +x /usr/local/bin/argocd
-
-# Install ArgoCD Server
-kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-# Wait for ArgoCD Server to be ready
-kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s
-
-# Get ArgoCD Server URL
-ARGOCD_SERVER_URL=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-
-# Set ArgoCD admin password
-ARGOCD_ADMIN_PASSWORD="ourfamily789654"  # Update with your desired password
-
-kubectl -n argocd patch secret argocd-secret \
-  -p '{"stringData": {
-    "admin.password": "'"$ARGOCD_ADMIN_PASSWORD"'"
-  }}'
-
-# ArgoCD setup
-echo "ArgoCD Server URL: $ARGOCD_SERVER_URL"
-
-# Create ArgoCD application manifest
-cat > argocd-application.yaml <<EOL
-apiVersion: argoproj.io/v1alpha1
-kind: Application
+# Configure Istio Gateway if not already configured
+if ! kubectl get gateway mygateway &>/dev/null; then
+  cat <<EOF > gateway.yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
 metadata:
-  name: my-containers
+  name: mygateway
 spec:
-  destination:
-    server: $ARGOCD_SERVER_URL
-    namespace: default
-  source:
-    path: argocd-application
-  project: default
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-EOL
+  selector:
+    istio: ingressgateway
+  servers:
+  - hosts:
+      - $IP_ADDRESS
+    port:
+      number: 80
+      name: http
+      protocol: HTTP
+EOF
+  kubectl apply -f gateway.yaml
+fi
 
-# Create argocd-application directory
-mkdir -p argocd-application
-
-# Create Artemis YAML manifest
-cat > argocd-application/artemis.yaml <<EOL
-apiVersion: v1
-kind: Pod
+# Configure Istio VirtualService for auth service if not already configured
+if ! kubectl get virtualservice auth &>/dev/null; then
+  cat <<EOF > auth-virtualservice.yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
 metadata:
-  name: artemis
-  labels:
-    app: artemis
+  name: auth
 spec:
-  containers:
-    - name: artemis
-      image: ghcr.io/secretkeeper/artemis:latest
-EOL
+  hosts:
+  - $IP_ADDRESS
+  gateways:
+  - mygateway
+  http:
+  - match:
+    - uri:
+        prefix: /auth
+    route:
+    - destination:
+        host: artemis.opensecret.ir
+        port:
+          number: 80
+EOF
+  kubectl apply -f auth-virtualservice.yaml
+fi
 
-# Create Whisper YAML manifest
-cat > argocd-application/whisper.yaml <<EOL
-apiVersion: v1
-kind: Pod
+# Configure Istio VirtualService for WebSocket service if not already configured
+if ! kubectl get virtualservice websocket &>/dev/null; then
+  cat <<EOF > websocket-virtualservice.yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
 metadata:
-  name: whisper
-  labels:
-    app: whisper
+  name: websocket
 spec:
-  containers:
-    - name: whisper
-      image: ghcr.io/secretkeeper/whisper:latest
-EOL
+  hosts:
+  - $IP_ADDRESS
+  gateways:
+  - mygateway
+  http:
+  - match:
+    - uri:
+        prefix: /ws
+    route:
+    - destination:
+        host: pheme.opensecret.ir
+        port:
+          number: 80
+EOF
+  kubectl apply -f websocket-virtualservice.yaml
+fi
 
-# Login to ArgoCD server
-argocd login --username admin --password "$ARGOCD_ADMIN_PASSWORD" --insecure $ARGOCD_SERVER_URL
+# Configure Istio AuthorizationPolicy for WebSocket JWT verification if not already configured
+if ! kubectl get authorizationpolicy websocket-authz &>/dev/null; then
+  cat <<EOF > websocket-authorizationpolicy.yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: websocket-authz
+spec:
+  selector:
+    matchLabels:
+      app: websocket
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/verify-token"]
+    when:
+    - key: request.headers[jwt-token]
+      values:
+      - "*"
+EOF
+  kubectl apply -f websocket-authorizationpolicy.yaml
+fi
 
-# Create ArgoCD application
-argocd app create my-containers --file argocd-application.yaml
-
-echo "ArgoCD application created successfully"
-
-echo "Setup complete!"
+echo "Istio setup complete!"
